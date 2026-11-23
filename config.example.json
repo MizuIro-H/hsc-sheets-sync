@@ -1,0 +1,11 @@
+{
+  "tasks": [
+    {
+      "google_spreadsheet_id": "REPLACE_WITH_GOOGLE_SHEET_ID",
+      "google_gid": "0",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "",
+      "create_title": "[回传测试] 腾讯目标表"
+    }
+  ]
+}

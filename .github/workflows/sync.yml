@@ -1,0 +1,42 @@
+name: Sync Google Sheets to Tencent Docs
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "忽略内容比对，强制全量覆写目标表"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # 每 30 分钟检查一次源表变更（Public 仓库标准 Runner 免费；未变更时仅读不写）
+    - cron: "*/30 * * * *"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 防止并发触发同时写入同一腾讯表格
+    concurrency:
+      group: sheets-sync
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Google Sheets -> Tencent Docs sync
+        env:
+          TENCENT_DOCS_TOKEN: ${{ secrets.TENCENT_DOCS_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          GOOGLE_GID: ${{ vars.GOOGLE_GID }}
+          TENCENT_FILE_ID: ${{ vars.TENCENT_FILE_ID }}
+          TENCENT_SHEET_NAME: ${{ vars.TENCENT_SHEET_NAME }}
+          FORCE_SYNC: ${{ github.event.inputs.force_sync || 'false' }}
+        run: python sync.py
