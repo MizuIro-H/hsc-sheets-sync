@@ -13,9 +13,9 @@ on:
         required: false
         default: ""
         type: string
-  schedule:
-    # 每 30 分钟检查一次源表变更（Public 仓库标准 Runner 免费；未变更时仅读不写）
-    - cron: "*/30 * * * *"
+  # 定时自动检查已按需求关闭，改为按需手动触发 workflow_dispatch（如需定时可取消下面两行注释）
+  # schedule:
+  #   - cron: "*/30 * * * *"
 
 jobs:
   sync:
