@@ -66,12 +66,30 @@ def build_cell_values(rows: list[list[str]]) -> list[dict[str, Any]]:
     return cells
 
 
+def normalize_cell_for_hash(text: str) -> str:
+    """按写入类型语义规范化单元格，消除常规数值尾零（如 0.70 与 0.7）引起的误判。"""
+    payload = infer_cell_payload(0, 0, text)
+    if payload is None:
+        return ""
+    vtype = payload["value_type"]
+    if vtype == "BOOL":
+        return "B:1" if payload["bool_value"] else "B:0"
+    if vtype == "NUMBER":
+        num = payload["number_value"]
+        if isinstance(num, float) and num.is_integer():
+            num = int(num)
+        elif num == 0:
+            num = 0
+        return f"N:{num!r}"
+    return f"S:{payload['string_value']}"
+
+
 def compute_matrix_hash(rows: list[list[str]]) -> str:
     """计算二维表格内容规范化后的 SHA-256 摘要，用于跳过未变更的同步。"""
     # 统一去除每行尾部纯空单元格与尾部纯空行，防止两平台空网格尺寸差异误触发写入
     normalized: list[list[str]] = []
     for row in rows:
-        trimmed = list(row)
+        trimmed = [normalize_cell_for_hash(cell) for cell in row]
         while trimmed and trimmed[-1] == "":
             trimmed.pop()
         normalized.append(trimmed)

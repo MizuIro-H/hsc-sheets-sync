@@ -259,6 +259,16 @@ class SyncUnitTests(unittest.TestCase):
         self.assertEqual((calls[1]["index"], calls[1]["count"], calls[1]["direction"]), (25, 100, "after"))
         self.assertEqual((calls[2]["index"], calls[2]["count"], calls[2]["direction"]), (125, 24, "after"))
 
+    def test_hash_normalizes_equivalent_numbers_and_bools_but_keeps_leading_zeros(self) -> None:
+        self.assertEqual(
+            sync.compute_matrix_hash([["0.70", "4.00", "true", "00789"]]),
+            sync.compute_matrix_hash([["0.7", "4", "TRUE", "00789"]]),
+        )
+        self.assertNotEqual(
+            sync.compute_matrix_hash([["00789"]]),
+            sync.compute_matrix_hash([["789"]]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
