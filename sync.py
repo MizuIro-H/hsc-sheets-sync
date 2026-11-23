@@ -406,10 +406,63 @@ def resolve_or_create_subsheet(
         if desired_id or not desired_name:
             raise
 
-    client.call_tool(MCP_SHEET_URL, "sheet.add_sheet", {"file_id": file_id, "name": desired_name})
+    client.call_tool(
+        MCP_SHEET_URL,
+        "sheet.add_sheet",
+        {"file_id": file_id, "name": desired_name, "append_index": True},
+    )
     print(f"[新建子表] {file_id} -> {desired_name}", file=sys.stderr)
     refreshed = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": file_id})
     return pick_target_subsheet(refreshed.get("sheets") or [], desired_name=desired_name)
+
+
+def _expand_dimension(
+    client: TencentMcpClient,
+    file_id: str,
+    sheet_id: str,
+    dim_type: str,
+    current: int,
+    needed: int,
+    batch_size: int,
+) -> int:
+    """在指定维度当前末尾之后分批插入缺失的行或列。"""
+    if current <= 0 or needed <= current:
+        return current
+    print(f"[扩展{dim_type}] {sheet_id}: {current} -> {needed}", file=sys.stderr)
+    cur = current
+    remaining = needed - cur
+    while remaining > 0:
+        step = min(remaining, batch_size)
+        client.call_tool(
+            MCP_SHEET_URL,
+            "sheet.insert_dimension",
+            {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "dimension_type": dim_type,
+                "index": cur - 1,
+                "count": step,
+                "direction": "after",
+            },
+        )
+        cur += step
+        remaining -= step
+    return cur
+
+
+def ensure_sheet_capacity(
+    client: TencentMcpClient,
+    file_id: str,
+    sheet_id: str,
+    current_rows: int,
+    current_cols: int,
+    needed_rows: int,
+    needed_cols: int,
+) -> tuple[int, int]:
+    """确保目标子表拥有足够容纳源表数据的行列数。"""
+    new_rows = _expand_dimension(client, file_id, sheet_id, "row", current_rows, needed_rows, 200)
+    new_cols = _expand_dimension(client, file_id, sheet_id, "col", current_cols, needed_cols, 100)
+    return new_rows, new_cols
 
 
 def read_sheet_matrix_chunked(
@@ -559,8 +612,17 @@ def sync_one_task(
         )
 
     max_src_cols = max((len(r) for r in rows), default=0)
-    clear_end_row = max(old_rows - 1, len(rows) - 1, 0)
-    clear_end_col = max(old_cols - 1, max_src_cols - 1, 0)
+    cur_rows, cur_cols = ensure_sheet_capacity(
+        client,
+        tencent_file_id,
+        sub_id,
+        old_rows,
+        old_cols,
+        len(rows),
+        max_src_cols,
+    )
+    clear_end_row = max(cur_rows - 1, len(rows) - 1, 0)
+    clear_end_col = max(cur_cols - 1, max_src_cols - 1, 0)
     if old_rows > 0 or rows:
         client.call_tool(
             MCP_SHEET_URL,

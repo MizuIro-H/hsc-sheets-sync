@@ -240,6 +240,25 @@ class SyncUnitTests(unittest.TestCase):
                 tasks = sync.load_tasks_from_env_or_config(cfg, explicit_config=True)
             self.assertEqual(tasks[0]["google_spreadsheet_id"], "from_cfg")
 
+    def test_ensure_sheet_capacity_expands_rows_and_cols_in_batches(self) -> None:
+        calls: list[dict] = []
+
+        class FakeClient:
+            def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
+                calls.append({"tool": tool_name, **args})
+                return {}
+
+        new_r, new_c = sync.ensure_sheet_capacity(
+            FakeClient(), "f1", "s1", current_rows=200, current_cols=26, needed_rows=205, needed_cols=150
+        )
+        self.assertEqual((new_r, new_c), (205, 150))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0]["dimension_type"], "row")
+        self.assertEqual((calls[0]["index"], calls[0]["count"], calls[0]["direction"]), (199, 5, "after"))
+        self.assertEqual(calls[1]["dimension_type"], "col")
+        self.assertEqual((calls[1]["index"], calls[1]["count"], calls[1]["direction"]), (25, 100, "after"))
+        self.assertEqual((calls[2]["index"], calls[2]["count"], calls[2]["direction"]), (125, 24, "after"))
+
 
 if __name__ == "__main__":
     unittest.main()
