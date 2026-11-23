@@ -18,7 +18,9 @@ from typing import Any
 MCP_GENERAL_URL = "https://docs.qq.com/openapi/mcp"
 MCP_SHEET_URL = "https://docs.qq.com/api/v6/sheet/mcp"
 DEFAULT_MAX_CELLS_PER_BATCH = 1500
-MAX_READ_CELLS = 20000
+READ_CHUNK_CELLS = 8000
+MAX_READ_CELLS = 200000
+READ_BACK_PREVIEW_CHARS = 1200
 
 _NUM_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
 
@@ -389,8 +391,96 @@ def pick_target_subsheet(
     return sheets[0]
 
 
+def resolve_or_create_subsheet(
+    client: TencentMcpClient,
+    file_id: str,
+    desired_id: str | None = None,
+    desired_name: str | None = None,
+) -> dict[str, Any]:
+    """获取目标子表元信息；若按名称未命中且允许创建，则自动新增该子表。"""
+    info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": file_id})
+    sheets = info.get("sheets") or []
+    try:
+        return pick_target_subsheet(sheets, desired_id=desired_id, desired_name=desired_name)
+    except RuntimeError:
+        if desired_id or not desired_name:
+            raise
+
+    client.call_tool(MCP_SHEET_URL, "sheet.add_sheet", {"file_id": file_id, "name": desired_name})
+    print(f"[新建子表] {file_id} -> {desired_name}", file=sys.stderr)
+    refreshed = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": file_id})
+    return pick_target_subsheet(refreshed.get("sheets") or [], desired_name=desired_name)
+
+
+def read_sheet_matrix_chunked(
+    client: TencentMcpClient,
+    file_id: str,
+    sheet_id: str,
+    total_rows: int,
+    total_cols: int,
+    chunk_cells: int = READ_CHUNK_CELLS,
+) -> tuple[list[list[str]], str]:
+    """按行分块读取指定范围矩阵并拼接为等行高二维数组，同时返回首块 CSV 文本。"""
+    if total_rows <= 0 or total_cols <= 0:
+        return [], ""
+
+    rows_per_chunk = max(1, chunk_cells // max(total_cols, 1))
+    all_rows: list[list[str]] = []
+    first_csv = ""
+    for r0 in range(0, total_rows, rows_per_chunk):
+        r1 = min(total_rows - 1, r0 + rows_per_chunk - 1)
+        res = client.call_tool(
+            MCP_SHEET_URL,
+            "sheet.get_cell_data",
+            {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "start_row": r0,
+                "start_col": 0,
+                "end_row": r1,
+                "end_col": total_cols - 1,
+                "return_csv": True,
+            },
+        )
+        csv_part = res.get("csv_data") or ""
+        if r0 == 0:
+            first_csv = csv_part
+        parsed = parse_csv_rows(csv_part)
+        expected_len = r1 - r0 + 1
+        # 对齐分块行数，避免前块为空时造成后续行索引偏移
+        if len(parsed) < expected_len:
+            parsed.extend([[]] * (expected_len - len(parsed)))
+        elif len(parsed) > expected_len:
+            parsed = parsed[:expected_len]
+        all_rows.extend(parsed)
+    return all_rows, first_csv
+
+
+def _first_diff_summary(src: list[list[str]], dst: list[list[str]]) -> str:
+    """定位源表与目标表首个存在差异的单元格，便于排查哈希不匹配。"""
+    max_r = max(len(src), len(dst))
+    for r in range(max_r):
+        sr = list(src[r]) if r < len(src) else []
+        dr = list(dst[r]) if r < len(dst) else []
+        while sr and sr[-1] == "":
+            sr.pop()
+        while dr and dr[-1] == "":
+            dr.pop()
+        if sr != dr:
+            max_c = max(len(sr), len(dr))
+            for c in range(max_c):
+                sv = sr[c] if c < len(sr) else ""
+                dv = dr[c] if c < len(dr) else ""
+                if sv != dv:
+                    return f"({r},{c}) src={sv!r} dst={dv!r}"
+    return "trailing_empty_diff"
+
+
 def sync_one_task(
-    client: TencentMcpClient, task: dict[str, Any], force: bool = False
+    client: TencentMcpClient,
+    task: dict[str, Any],
+    force: bool = False,
+    title_cache: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """执行单个 Google 工作表到腾讯文档子表的单向覆盖同步。"""
     google_id = task["google_spreadsheet_id"].strip()
@@ -402,56 +492,50 @@ def sync_one_task(
     tencent_url = ""
     if not tencent_file_id:
         title = (task.get("create_title") or "[回传测试] 腾讯目标表")[:36]
-        # 优先按标题复用已有同名测试表，避免重复调试产生多个副本
-        search_res = client.call_tool(
-            MCP_GENERAL_URL, "manage.search_file", {"search_key": title}
-        )
-        for item in search_res.get("list") or []:
-            if item.get("title") == title and item.get("file_id"):
-                tencent_file_id = item["file_id"]
-                tencent_url = item.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
-                break
-        if not tencent_file_id:
-            created = client.call_tool(
-                MCP_GENERAL_URL, "manage.create_file", {"title": title, "file_type": "sheet"}
+        if title_cache is not None and title in title_cache:
+            tencent_file_id, tencent_url = title_cache[title]
+        else:
+            # 优先按标题复用已有同名表，避免重复调试产生多个副本
+            search_res = client.call_tool(
+                MCP_GENERAL_URL, "manage.search_file", {"search_key": title}
             )
-            tencent_file_id = created.get("file_id", "")
-            tencent_url = created.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
-        if not tencent_file_id:
-            raise RuntimeError("自动获取或创建腾讯空白表失败")
+            for item in search_res.get("list") or []:
+                if item.get("title") == title and item.get("file_id"):
+                    tencent_file_id = item["file_id"]
+                    tencent_url = item.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
+                    break
+            if not tencent_file_id:
+                created = client.call_tool(
+                    MCP_GENERAL_URL, "manage.create_file", {"title": title, "file_type": "sheet"}
+                )
+                tencent_file_id = created.get("file_id", "")
+                tencent_url = created.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
+            if not tencent_file_id:
+                raise RuntimeError("自动获取或创建腾讯空白表失败")
+            if title_cache is not None:
+                title_cache[title] = (tencent_file_id, tencent_url)
     else:
         tencent_url = f"https://docs.qq.com/sheet/{tencent_file_id}"
     print(f"[目标腾讯表] {tencent_file_id} -> {tencent_url}", file=sys.stderr)
 
-    info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": tencent_file_id})
-    sub = pick_target_subsheet(
-        info.get("sheets") or [],
+    sub = resolve_or_create_subsheet(
+        client,
+        tencent_file_id,
         desired_id=task.get("tencent_sheet_id") or None,
         desired_name=task.get("tencent_sheet_name") or None,
     )
     sub_id = sub["sheet_id"]
     old_rows, old_cols = extract_used_dimensions(sub)
     print(
-        f"[子表元数据] sheet_id={sub_id}, dims=({old_rows}, {old_cols}), raw={json.dumps(sub, ensure_ascii=False)}",
+        f"[子表元数据] sheet_id={sub_id}, name={sub.get('sheet_name')}, dims=({old_rows}, {old_cols})",
         file=sys.stderr,
     )
 
-    # 通过回读目标当前内容做变化检测，未改动则直接跳过写入，减少版本碎片
+    # 通过分块回读当前内容做变化检测，未改动则直接跳过写入，减少版本碎片
     if not force and old_rows > 0 and old_cols > 0 and old_rows * old_cols <= MAX_READ_CELLS:
-        existing = client.call_tool(
-            MCP_SHEET_URL,
-            "sheet.get_cell_data",
-            {
-                "file_id": tencent_file_id,
-                "sheet_id": sub_id,
-                "start_row": 0,
-                "start_col": 0,
-                "end_row": old_rows - 1,
-                "end_col": old_cols - 1,
-                "return_csv": True,
-            },
+        existing_rows, _ = read_sheet_matrix_chunked(
+            client, tencent_file_id, sub_id, old_rows, old_cols
         )
-        existing_rows = parse_csv_rows(existing.get("csv_data") or "")
         existing_hash = compute_matrix_hash(existing_rows)
         if existing_hash == src_hash:
             return {
@@ -460,10 +544,12 @@ def sync_one_task(
                 "tencent_file_id": tencent_file_id,
                 "tencent_url": tencent_url,
                 "sheet_id": sub_id,
+                "sheet_name": sub.get("sheet_name"),
             }
         print(
             f"[变化检测未命中] src_rows={len(rows)}, existing_rows={len(existing_rows)}, "
-            f"src_hash={src_hash[:12]}, existing_hash={existing_hash[:12]}",
+            f"src_hash={src_hash[:12]}, existing_hash={existing_hash[:12]}, "
+            f"first_diff={_first_diff_summary(rows, existing_rows)}",
             file=sys.stderr,
         )
     else:
@@ -499,21 +585,21 @@ def sync_one_task(
         )
 
     read_back_csv = ""
+    verified_hash_match: bool | None = None
     if rows and max_src_cols > 0 and len(rows) * max_src_cols <= MAX_READ_CELLS:
-        rb = client.call_tool(
-            MCP_SHEET_URL,
-            "sheet.get_cell_data",
-            {
-                "file_id": tencent_file_id,
-                "sheet_id": sub_id,
-                "start_row": 0,
-                "start_col": 0,
-                "end_row": len(rows) - 1,
-                "end_col": max_src_cols - 1,
-                "return_csv": True,
-            },
+        rb_rows, first_csv = read_sheet_matrix_chunked(
+            client, tencent_file_id, sub_id, len(rows), max_src_cols
         )
-        read_back_csv = rb.get("csv_data") or ""
+        verified_hash_match = compute_matrix_hash(rb_rows) == src_hash
+        if not verified_hash_match:
+            print(
+                f"[写入回读差异] first_diff={_first_diff_summary(rows, rb_rows)}",
+                file=sys.stderr,
+            )
+        if len(first_csv) > READ_BACK_PREVIEW_CHARS:
+            read_back_csv = first_csv[:READ_BACK_PREVIEW_CHARS] + "\n... (truncated)"
+        else:
+            read_back_csv = first_csv
 
     return {
         "skipped": False,
@@ -522,28 +608,34 @@ def sync_one_task(
         "sheet_id": sub_id,
         "sheet_name": sub.get("sheet_name"),
         "source_rows": len(rows),
+        "source_cols": max_src_cols,
         "written_cells": len(values),
+        "verified_hash_match": verified_hash_match,
         "read_back_csv": read_back_csv,
     }
 
 
-def load_tasks_from_env_or_config(config_path: Path) -> list[dict[str, Any]]:
-    """从环境变量或配置文件加载同步任务列表，环境变量优先生效。"""
-    env_google_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-    if env_google_id:
-        return [
-            {
-                "google_spreadsheet_id": env_google_id,
-                "google_gid": os.getenv("GOOGLE_GID", "0").strip() or "0",
-                "tencent_file_id": os.getenv("TENCENT_FILE_ID", "").strip(),
-                "tencent_sheet_id": os.getenv("TENCENT_SHEET_ID", "").strip(),
-                "tencent_sheet_name": os.getenv("TENCENT_SHEET_NAME", "").strip(),
-                "create_title": os.getenv("TENCENT_CREATE_TITLE", "[回传测试] 腾讯目标表").strip(),
-            }
-        ]
+def load_tasks_from_env_or_config(
+    config_path: Path, explicit_config: bool = False
+) -> list[dict[str, Any]]:
+    """从显式配置文件、环境变量或默认配置文件加载同步任务列表。"""
+    if not explicit_config:
+        env_google_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+        if env_google_id:
+            return [
+                {
+                    "google_spreadsheet_id": env_google_id,
+                    "google_gid": os.getenv("GOOGLE_GID", "0").strip() or "0",
+                    "tencent_file_id": os.getenv("TENCENT_FILE_ID", "").strip(),
+                    "tencent_sheet_id": os.getenv("TENCENT_SHEET_ID", "").strip(),
+                    "tencent_sheet_name": os.getenv("TENCENT_SHEET_NAME", "").strip(),
+                    "create_title": os.getenv("TENCENT_CREATE_TITLE", "[回传测试] 腾讯目标表").strip(),
+                }
+            ]
 
     if not config_path.exists():
-        raise FileNotFoundError(f"未找到配置文件且未设置 GOOGLE_SHEET_ID：{config_path}")
+        hint = "指定的同步配置文件" if explicit_config else "配置文件且未设置 GOOGLE_SHEET_ID"
+        raise FileNotFoundError(f"未找到{hint}：{config_path}")
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     tasks = raw.get("tasks") if isinstance(raw, dict) else raw
     if not isinstance(tasks, list) or not tasks:
@@ -559,13 +651,15 @@ def main() -> int:
         return 2
 
     force = os.getenv("FORCE_SYNC", "").strip().lower() in {"1", "true", "yes"}
-    config_file = Path(os.getenv("SYNC_CONFIG", "config.json"))
-    tasks = load_tasks_from_env_or_config(config_file)
+    env_config = os.getenv("SYNC_CONFIG", "").strip()
+    config_file = Path(env_config) if env_config else Path("config.json")
+    tasks = load_tasks_from_env_or_config(config_file, explicit_config=bool(env_config))
     client = TencentMcpClient(token)
+    title_cache: dict[str, tuple[str, str]] = {}
 
     results = []
     for idx, task in enumerate(tasks, start=1):
-        res = sync_one_task(client, task, force=force)
+        res = sync_one_task(client, task, force=force, title_cache=title_cache)
         results.append({"task": idx, **res})
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0

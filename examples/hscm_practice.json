@@ -1,0 +1,39 @@
+{
+  "tasks": [
+    {
+      "google_spreadsheet_id": "1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk",
+      "google_gid": "49828643",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "_sync_总决赛图池",
+      "create_title": "[实战测试] HSCM 回传目标表"
+    },
+    {
+      "google_spreadsheet_id": "1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk",
+      "google_gid": "1237373495",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "_sync_总决赛表现",
+      "create_title": "[实战测试] HSCM 回传目标表"
+    },
+    {
+      "google_spreadsheet_id": "1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk",
+      "google_gid": "736924332",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "_sync_总决赛个人榜",
+      "create_title": "[实战测试] HSCM 回传目标表"
+    },
+    {
+      "google_spreadsheet_id": "1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk",
+      "google_gid": "2132272500",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "_sync_总决赛个人数据",
+      "create_title": "[实战测试] HSCM 回传目标表"
+    },
+    {
+      "google_spreadsheet_id": "14-UQTNTbOihr5qH0jEYl0Ld_v9BQdPoARLepv1jNoZs",
+      "google_gid": "439515232",
+      "tencent_file_id": "",
+      "tencent_sheet_name": "_sync_瑞士轮二队伍",
+      "create_title": "[实战测试] HSCM 回传目标表"
+    }
+  ]
+}

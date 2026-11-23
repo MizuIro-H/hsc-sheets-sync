@@ -194,6 +194,52 @@ class SyncUnitTests(unittest.TestCase):
             (4, 5),
         )
 
+    def test_read_sheet_matrix_chunked_preserves_empty_row_offsets(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        class FakeClient:
+            def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
+                calls.append((args["start_row"], args["end_row"]))
+                if args["start_row"] == 0:
+                    return {"csv_data": "h1,h2\n"}
+                return {"csv_data": "\nv2\n"}
+
+        rows, first_csv = sync.read_sheet_matrix_chunked(
+            FakeClient(), "f1", "s1", total_rows=4, total_cols=2, chunk_cells=4
+        )
+        self.assertEqual(calls, [(0, 1), (2, 3)])
+        self.assertEqual(first_csv, "h1,h2\n")
+        self.assertEqual(rows, [["h1", "h2"], [], [], ["v2"]])
+
+    def test_resolve_or_create_subsheet_creates_missing_named_sheet(self) -> None:
+        seen: list[str] = []
+        state = {"sheets": [{"sheet_id": "s0", "sheet_name": "工作表1"}]}
+
+        class FakeClient:
+            def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
+                seen.append(tool_name)
+                if tool_name == "sheet.get_sheet_info":
+                    return {"sheets": list(state["sheets"])}
+                if tool_name == "sheet.add_sheet":
+                    state["sheets"].append({"sheet_id": "s1", "sheet_name": args["name"]})
+                    return {"sheet_id": "s1"}
+                raise AssertionError(f"未预期调用: {tool_name}")
+
+        sub = sync.resolve_or_create_subsheet(FakeClient(), "f1", desired_name="_sync_图池")
+        self.assertEqual(sub["sheet_id"], "s1")
+        self.assertEqual(seen, ["sheet.get_sheet_info", "sheet.add_sheet", "sheet.get_sheet_info"])
+
+    def test_explicit_sync_config_overrides_env_google_id(self) -> None:
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "custom.json"
+            cfg.write_text('{"tasks": [{"google_spreadsheet_id": "from_cfg"}]}', encoding="utf-8")
+            with patch.dict(os.environ, {"GOOGLE_SHEET_ID": "from_env"}):
+                tasks = sync.load_tasks_from_env_or_config(cfg, explicit_config=True)
+            self.assertEqual(tasks[0]["google_spreadsheet_id"], "from_cfg")
+
 
 if __name__ == "__main__":
     unittest.main()

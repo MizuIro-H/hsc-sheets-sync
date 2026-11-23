@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      config_path:
+        description: "可选：多任务配置文件路径（留空则读取 Repo Variables）"
+        required: false
+        default: ""
+        type: string
   schedule:
     # 每 30 分钟检查一次源表变更（Public 仓库标准 Runner 免费；未变更时仅读不写）
     - cron: "*/30 * * * *"
@@ -39,4 +44,5 @@ jobs:
           TENCENT_FILE_ID: ${{ vars.TENCENT_FILE_ID }}
           TENCENT_SHEET_NAME: ${{ vars.TENCENT_SHEET_NAME }}
           FORCE_SYNC: ${{ github.event.inputs.force_sync || 'false' }}
+          SYNC_CONFIG: ${{ github.event.inputs.config_path || '' }}
         run: python sync.py
