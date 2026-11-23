@@ -87,6 +87,8 @@ class SyncUnitTests(unittest.TestCase):
         class FakeClient:
             def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
                 calls.append((endpoint, tool_name, args))
+                if tool_name == "manage.search_file":
+                    return {"list": []}
                 if tool_name == "manage.create_file":
                     return {"file_id": "new_t1", "url": "https://docs.qq.com/sheet/new_t1"}
                 if tool_name == "sheet.get_sheet_info":
@@ -111,12 +113,67 @@ class SyncUnitTests(unittest.TestCase):
         self.assertEqual(
             [c[1] for c in calls],
             [
+                "manage.search_file",
                 "manage.create_file",
                 "sheet.get_sheet_info",
                 "sheet.clear_range_cells",
                 "sheet.set_range_value",
                 "sheet.get_cell_data",
             ],
+        )
+
+    def test_client_resolves_unprefixed_tool_on_method_not_found(self) -> None:
+        client = sync.TencentMcpClient("test-token")
+        seen_methods: list[tuple[str, str]] = []
+
+        def fake_post(
+            endpoint: str, auth_header: str, session_id: str | None, payload: dict
+        ) -> tuple[int, dict[str, str], str]:
+            method = payload["method"]
+            if method == "initialize":
+                return 200, {"mcp-session-id": "sid-1"}, '{"jsonrpc":"2.0","id":1,"result":{}}'
+            if method == "notifications/initialized":
+                return 202, {}, ""
+            if method == "tools/list":
+                seen_methods.append((method, ""))
+                return (
+                    200,
+                    {},
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": payload["id"],
+                            "result": {
+                                "tools": [
+                                    {"name": "get_sheet_info", "inputSchema": {"properties": {"file_id": {}}}}
+                                ]
+                            },
+                        }
+                    ),
+                )
+            if method == "tools/call":
+                name = payload["params"]["name"]
+                seen_methods.append((method, name))
+                if name == "sheet.get_sheet_info":
+                    return (
+                        200,
+                        {},
+                        '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"tool not found"}}',
+                    )
+                if name == "get_sheet_info":
+                    return (
+                        200,
+                        {},
+                        '{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"sheets":[{"sheet_id":"s0"}]}}}',
+                    )
+            raise AssertionError(f"未预期请求: {payload}")
+
+        with patch.object(client, "_post_raw", side_effect=fake_post):
+            res = client.call_tool(sync.MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": "f1"})
+        self.assertEqual(res["sheets"][0]["sheet_id"], "s0")
+        self.assertEqual(
+            seen_methods,
+            [("tools/call", "sheet.get_sheet_info"), ("tools/list", ""), ("tools/call", "get_sheet_info")],
         )
 
 

@@ -143,6 +143,7 @@ class TencentMcpClient:
             raise ValueError("缺少环境变量 TENCENT_DOCS_TOKEN")
         self._timeout = timeout
         self._sessions: dict[str, str | None] = {}
+        self._tools_cache: dict[str, list[dict[str, Any]]] = {}
         self._auth_header: str = self._token
         self._req_id = 0
 
@@ -210,8 +211,60 @@ class TencentMcpClient:
             )
         return session_id
 
-    def call_tool(self, endpoint: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """调用指定 MCP 端点上的工具并统一处理 JSON-RPC 及业务错误。"""
+    def list_tools(self, endpoint: str) -> list[dict[str, Any]]:
+        """拉取并缓存指定 MCP 端点已注册的工具清单与参数 Schema。"""
+        if endpoint in self._tools_cache:
+            return self._tools_cache[endpoint]
+
+        session_id = self._ensure_session(endpoint)
+        payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": "tools/list", "params": {}}
+        status, _, body = self._post_raw(endpoint, self._auth_header, session_id, payload)
+        if status >= 400:
+            raise RuntimeError(f"MCP tools/list({endpoint}) HTTP {status}: {body[:300]}")
+
+        rpc = parse_mcp_response_body(body)
+        if not rpc or rpc.get("error"):
+            raise RuntimeError(f"MCP tools/list({endpoint}) 错误: {rpc or body[:300]}")
+
+        tools = (rpc.get("result") or {}).get("tools") or []
+        self._tools_cache[endpoint] = tools
+        summary = [
+            {
+                "name": t.get("name"),
+                "props": sorted(((t.get("inputSchema") or {}).get("properties") or {}).keys()),
+            }
+            for t in tools
+        ]
+        print(
+            f"[MCP tools/list] {endpoint}: {json.dumps(summary, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+        return tools
+
+    def _resolve_tool_name(self, endpoint: str, desired_name: str) -> str:
+        """在已缓存的 tools/list 中按精确/无前缀/下划线等候选规则匹配真实工具名。"""
+        tools = self._tools_cache.get(endpoint)
+        if not tools:
+            return desired_name
+        available = [t.get("name", "") for t in tools]
+        short = desired_name.split(".", 1)[-1]
+        candidates = [
+            desired_name,
+            short,
+            desired_name.replace(".", "_"),
+        ]
+        for cand in candidates:
+            if cand in available:
+                return cand
+        for name in available:
+            if name.endswith(f".{short}") or name.endswith(f"_{short}"):
+                return name
+        return desired_name
+
+    def _invoke_tool_once(
+        self, endpoint: str, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """发送单次 tools/call；若命中 JSON-RPC 错误则返回 (None, rpc_error)。"""
         session_id = self._ensure_session(endpoint)
         payload = {
             "jsonrpc": "2.0",
@@ -226,12 +279,29 @@ class TencentMcpClient:
         rpc = parse_mcp_response_body(body)
         if not rpc:
             raise RuntimeError(f"MCP 响应无法解析 ({tool_name}): {body[:300]}")
-        if "error" in rpc and rpc["error"]:
-            raise RuntimeError(f"MCP JSON-RPC 错误 ({tool_name}): {rpc['error']}")
+        if rpc.get("error"):
+            return None, rpc["error"]
+        return rpc, None
 
-        result = rpc.get("result") or {}
+    def call_tool(self, endpoint: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """调用指定 MCP 端点上的工具并统一处理工具名兼容、JSON-RPC 及业务错误。"""
+        actual_name = self._resolve_tool_name(endpoint, tool_name)
+        rpc, rpc_err = self._invoke_tool_once(endpoint, actual_name, arguments)
+
+        # 若工具未找到（-32601），主动查询 tools/list 自动适配真实工具名后重试一次
+        if rpc_err and rpc_err.get("code") == -32601 and endpoint not in self._tools_cache:
+            self.list_tools(endpoint)
+            resolved = self._resolve_tool_name(endpoint, tool_name)
+            if resolved != actual_name:
+                actual_name = resolved
+                rpc, rpc_err = self._invoke_tool_once(endpoint, actual_name, arguments)
+
+        if rpc_err:
+            raise RuntimeError(f"MCP JSON-RPC 错误 ({actual_name}): {rpc_err}")
+
+        result = (rpc or {}).get("result") or {}
         if result.get("isError"):
-            raise RuntimeError(f"MCP 工具执行错误 ({tool_name}): {result}")
+            raise RuntimeError(f"MCP 工具执行错误 ({actual_name}): {result}")
 
         parsed: dict[str, Any] = {}
         if "structuredContent" in result and isinstance(result["structuredContent"], dict):
@@ -248,7 +318,7 @@ class TencentMcpClient:
             parsed = result
 
         if parsed.get("error") or (parsed.get("ret") not in (None, 0)):
-            raise RuntimeError(f"腾讯文档返回业务错误 ({tool_name}): {parsed}")
+            raise RuntimeError(f"腾讯文档返回业务错误 ({actual_name}): {parsed}")
         return parsed
 
 
@@ -284,15 +354,26 @@ def sync_one_task(
     tencent_url = ""
     if not tencent_file_id:
         title = (task.get("create_title") or "[回传测试] 腾讯目标表")[:36]
-        created = client.call_tool(
-            MCP_GENERAL_URL, "manage.create_file", {"title": title, "file_type": "sheet"}
+        # 优先按标题复用已有同名测试表，避免重复调试产生多个副本
+        search_res = client.call_tool(
+            MCP_GENERAL_URL, "manage.search_file", {"search_key": title}
         )
-        tencent_file_id = created.get("file_id", "")
-        tencent_url = created.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
+        for item in search_res.get("list") or []:
+            if item.get("title") == title and item.get("file_id"):
+                tencent_file_id = item["file_id"]
+                tencent_url = item.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
+                break
         if not tencent_file_id:
-            raise RuntimeError(f"自动创建腾讯空白表失败: {created}")
+            created = client.call_tool(
+                MCP_GENERAL_URL, "manage.create_file", {"title": title, "file_type": "sheet"}
+            )
+            tencent_file_id = created.get("file_id", "")
+            tencent_url = created.get("url") or f"https://docs.qq.com/sheet/{tencent_file_id}"
+        if not tencent_file_id:
+            raise RuntimeError("自动获取或创建腾讯空白表失败")
     else:
         tencent_url = f"https://docs.qq.com/sheet/{tencent_file_id}"
+    print(f"[目标腾讯表] {tencent_file_id} -> {tencent_url}", file=sys.stderr)
 
     info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": tencent_file_id})
     sub = pick_target_subsheet(
