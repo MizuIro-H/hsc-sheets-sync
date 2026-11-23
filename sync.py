@@ -80,6 +80,54 @@ def compute_matrix_hash(rows: list[list[str]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _col_letters_to_number(letters: str) -> int:
+    """将 Excel 列字母（如 A、E、AA）转换为从 1 开始的列数。"""
+    num = 0
+    for ch in letters.upper():
+        num = num * 26 + (ord(ch) - ord("A") + 1)
+    return num
+
+
+def _parse_range_dimensions(range_str: str) -> tuple[int, int]:
+    """从 A1:E4 类范围字符串提取覆盖的最大行数与列数。"""
+    matches = re.findall(r"([A-Za-z]+)(\d+)", range_str)
+    if not matches:
+        return 0, 0
+    max_col = max(_col_letters_to_number(col) for col, _ in matches)
+    max_row = max(int(row) for _, row in matches)
+    return max_row, max_col
+
+
+def extract_used_dimensions(sub: dict[str, Any]) -> tuple[int, int]:
+    """兼容多种 get_sheet_info 返回结构，提取子表已用行列数。"""
+    used = sub.get("used_range")
+    if isinstance(used, str) and used.strip():
+        r, c = _parse_range_dimensions(used)
+        if r > 0 and c > 0:
+            return r, c
+    if isinstance(used, dict):
+        r = used.get("row_count") or used.get("rows") or used.get("rowCount")
+        c = used.get("col_count") or used.get("cols") or used.get("colCount")
+        if r is None and used.get("end_row") is not None:
+            r = int(used["end_row"]) + 1
+        if c is None and used.get("end_col") is not None:
+            c = int(used["end_col"]) + 1
+        if r and c:
+            return int(r), int(c)
+
+    for r_key, c_key in (
+        ("used_row_count", "used_col_count"),
+        ("row_count", "col_count"),
+        ("rowCount", "colCount"),
+        ("max_row", "max_col"),
+    ):
+        r_val = sub.get(r_key)
+        c_val = sub.get(c_key)
+        if r_val and c_val:
+            return int(r_val), int(c_val)
+    return 0, 0
+
+
 def parse_csv_rows(csv_text: str) -> list[list[str]]:
     """解析 UTF-8 CSV 文本（自动处理 BOM）为二维字符串数组。"""
     cleaned = csv_text.lstrip("\ufeff")
@@ -382,9 +430,11 @@ def sync_one_task(
         desired_name=task.get("tencent_sheet_name") or None,
     )
     sub_id = sub["sheet_id"]
-    used = sub.get("used_range") or {}
-    old_rows = int(used.get("row_count") or 0)
-    old_cols = int(used.get("col_count") or 0)
+    old_rows, old_cols = extract_used_dimensions(sub)
+    print(
+        f"[子表元数据] sheet_id={sub_id}, dims=({old_rows}, {old_cols}), raw={json.dumps(sub, ensure_ascii=False)}",
+        file=sys.stderr,
+    )
 
     # 通过回读目标当前内容做变化检测，未改动则直接跳过写入，减少版本碎片
     if not force and old_rows > 0 and old_cols > 0 and old_rows * old_cols <= MAX_READ_CELLS:
@@ -402,7 +452,8 @@ def sync_one_task(
             },
         )
         existing_rows = parse_csv_rows(existing.get("csv_data") or "")
-        if compute_matrix_hash(existing_rows) == src_hash:
+        existing_hash = compute_matrix_hash(existing_rows)
+        if existing_hash == src_hash:
             return {
                 "skipped": True,
                 "reason": "目标表格内容已与源表一致",
@@ -410,6 +461,16 @@ def sync_one_task(
                 "tencent_url": tencent_url,
                 "sheet_id": sub_id,
             }
+        print(
+            f"[变化检测未命中] src_rows={len(rows)}, existing_rows={len(existing_rows)}, "
+            f"src_hash={src_hash[:12]}, existing_hash={existing_hash[:12]}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[跳过变化检测] force={force}, old_rows={old_rows}, old_cols={old_cols}",
+            file=sys.stderr,
+        )
 
     max_src_cols = max((len(r) for r in rows), default=0)
     clear_end_row = max(old_rows - 1, len(rows) - 1, 0)

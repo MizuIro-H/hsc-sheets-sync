@@ -176,6 +176,24 @@ class SyncUnitTests(unittest.TestCase):
             [("tools/call", "sheet.get_sheet_info"), ("tools/list", ""), ("tools/call", "get_sheet_info")],
         )
 
+    def test_extract_used_dimensions_variants(self) -> None:
+        self.assertEqual(
+            sync.extract_used_dimensions({"used_range": {"row_count": 4, "col_count": 5}}),
+            (4, 5),
+        )
+        self.assertEqual(
+            sync.extract_used_dimensions({"used_range": {"start_row": 0, "end_row": 3, "start_col": 0, "end_col": 4}}),
+            (4, 5),
+        )
+        self.assertEqual(
+            sync.extract_used_dimensions({"used_range": "工作表1!A1:E4"}),
+            (4, 5),
+        )
+        self.assertEqual(
+            sync.extract_used_dimensions({"row_count": 4, "col_count": 5}),
+            (4, 5),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
