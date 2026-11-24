@@ -30,6 +30,13 @@
 3. 前往 **Actions → Sync Google Sheets to Tencent Docs → Run workflow** 按需手动触发即可；当前已关闭自动定时检查（如需自动周期检查，可在 [sync.yml](.github/workflows/sync.yml) 中取消 `schedule` 段注释）。
 4. 多表/多分页同步可参考 [config.example.json](config.example.json) 与 [examples/hscm_practice.json](examples/hscm_practice.json)，触发时在 `config_path` 填入路径即可覆盖单表环境变量。
 
+## 使用边界与注意事项
+
+- **数据源必须公开只读**：通过 Google Sheets 公开导出 CSV 读取数据，**未公开图池、裁判后台备注或隐私数据不要使用本方式**，也勿将私密表 ID 写入 Public 仓库文件。
+- **URL 与公式导出特点**：公开 CSV 仅导出显示文本；`HYPERLINK("url", "文字")` 公式会丢失超链接地址，谱面链接请直接在单元格存放完整 URL 文本。带千分位逗号或 `%` 文本按原样字符串写入展示，若需参加公式汇总建议在源表保留纯数值。
+- **子表约束与重试**：新建子表名需控制在 **31 字符**内且不含 `: \ / ? * [ ]`；脚本已内置 `429/5xx` 与网络瞬断退避重试、超大表分块读/清以及多任务故障隔离（单表异常不中断其余分页）。
+- **个人 Token 有效期**：如后续遭遇鉴权错误，重新登录腾讯文档获取个人 Token 并更新 GitHub Secret `TENCENT_DOCS_TOKEN` 即可。
+
 ## 本地调试与测试
 
 ```bash

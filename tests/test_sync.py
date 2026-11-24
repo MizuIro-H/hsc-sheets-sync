@@ -269,6 +269,94 @@ class SyncUnitTests(unittest.TestCase):
             sync.compute_matrix_hash([["789"]]),
         )
 
+    def test_http_retry_recovers_after_transient_503(self) -> None:
+        import io
+        import urllib.error
+        import urllib.request
+
+        class FakeResp:
+            status = 200
+            headers = {"Content-Type": "text/csv; charset=utf-8"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self) -> bytes:
+                return "a,b\n1,2\n".encode("utf-8")
+
+        attempts = {"n": 0}
+
+        def fake_urlopen(req, timeout=30):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"busy")
+                )
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            rows = sync.fetch_google_sheet_csv("gid_ok", "0", retries=2, retry_delay=0)
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(rows, [["a", "b"], ["1", "2"]])
+
+    def test_clear_sheet_range_chunked_splits_large_ranges(self) -> None:
+        ranges: list[tuple[int, int, int, int]] = []
+
+        class FakeClient:
+            def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
+                self.last = tool_name
+                ranges.append((args["start_row"], args["end_row"], args["start_col"], args["end_col"]))
+                return {}
+
+        sync.clear_sheet_range_chunked(
+            FakeClient(), "f1", "s1", end_row=4, end_col=3, chunk_cells=8
+        )
+        self.assertEqual(ranges, [(0, 1, 0, 3), (2, 3, 0, 3), (4, 4, 0, 3)])
+
+    def test_validate_task_config_checks_sheet_name_constraints(self) -> None:
+        sync.validate_task_config({"google_spreadsheet_id": "g1", "tencent_sheet_name": "_sync_合法"})
+        with self.assertRaises(ValueError):
+            sync.validate_task_config({"google_spreadsheet_id": "", "tencent_sheet_name": "ok"})
+        with self.assertRaises(ValueError):
+            sync.validate_task_config({"google_spreadsheet_id": "g1", "tencent_sheet_name": "a" * 32})
+        with self.assertRaises(ValueError):
+            sync.validate_task_config({"google_spreadsheet_id": "g1", "tencent_sheet_name": "bad/name"})
+
+    def test_main_isolates_task_failures_and_returns_nonzero(self) -> None:
+        import contextlib
+        import io
+        import os
+
+        tasks = [
+            {"google_spreadsheet_id": "bad_g", "tencent_sheet_name": "tab1"},
+            {"google_spreadsheet_id": "ok_g", "tencent_sheet_name": "tab2"},
+        ]
+
+        def fake_sync(client, task, force=False, title_cache=None):
+            if task["google_spreadsheet_id"] == "bad_g":
+                raise RuntimeError("boom")
+            return {"skipped": True, "sheet_name": "tab2"}
+
+        buf = io.StringIO()
+        with (
+            patch.dict(os.environ, {"TENCENT_DOCS_TOKEN": "tok", "SYNC_CONFIG": "dummy.json"}),
+            patch.object(sync, "load_tasks_from_env_or_config", return_value=tasks),
+            patch.object(sync, "sync_one_task", side_effect=fake_sync),
+            contextlib.redirect_stdout(buf),
+        ):
+            code = sync.main()
+
+        self.assertEqual(code, 1)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(len(out), 2)
+        self.assertFalse(out[0]["ok"])
+        self.assertIn("boom", out[0]["error"])
+        self.assertTrue(out[1]["ok"])
+        self.assertTrue(out[1]["skipped"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,10 +20,15 @@ MCP_GENERAL_URL = "https://docs.qq.com/openapi/mcp"
 MCP_SHEET_URL = "https://docs.qq.com/api/v6/sheet/mcp"
 DEFAULT_MAX_CELLS_PER_BATCH = 1500
 READ_CHUNK_CELLS = 8000
+CLEAR_CHUNK_CELLS = 20000
 MAX_READ_CELLS = 200000
 READ_BACK_PREVIEW_CHARS = 1200
+MAX_SHEET_NAME_LEN = 31
+DEFAULT_HTTP_RETRIES = 2
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 _NUM_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
+_INVALID_SHEET_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
 
 
 def infer_cell_payload(row: int, col: int, text: str) -> dict[str, Any] | None:
@@ -157,19 +163,55 @@ def parse_csv_rows(csv_text: str) -> list[list[str]]:
     return [list(row) for row in reader]
 
 
-def fetch_google_sheet_csv(sheet_id: str, gid: str = "0", timeout: int = 30) -> list[list[str]]:
+def _http_request_with_retry(
+    req: urllib.request.Request,
+    *,
+    timeout: int = 30,
+    retries: int = DEFAULT_HTTP_RETRIES,
+    retry_delay: float = 1.0,
+) -> tuple[int, dict[str, str], str]:
+    """执行 HTTP 请求并对 429/5xx 与网络瞬断进行指数退避重试。"""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                return resp.status, resp_headers, resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            if exc.code in TRANSIENT_HTTP_STATUSES and attempt < retries:
+                time.sleep(retry_delay * (2**attempt))
+                continue
+            return exc.code, resp_headers, body
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(retry_delay * (2**attempt))
+                continue
+            raise RuntimeError(f"网络请求失败 ({req.full_url}): {exc}") from last_exc
+    raise RuntimeError(f"网络请求重试耗尽 ({req.full_url}): {last_exc}")
+
+
+def fetch_google_sheet_csv(
+    sheet_id: str,
+    gid: str = "0",
+    timeout: int = 30,
+    retries: int = DEFAULT_HTTP_RETRIES,
+    retry_delay: float = 1.0,
+) -> list[list[str]]:
     """通过 Google Sheets 公开只读导出地址拉取指定分页 CSV。"""
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     req = urllib.request.Request(url, headers={"User-Agent": "hsc-sheets-sync/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content_type = (resp.headers.get("Content-Type") or "").lower()
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
+    status, headers, raw = _http_request_with_retry(
+        req, timeout=timeout, retries=retries, retry_delay=retry_delay
+    )
+    if status >= 400:
         raise RuntimeError(
-            f"拉取 Google 表格失败 (HTTP {exc.code})；请确认源表已设为「知道链接的任何人可查看」或 Sheet ID / GID 正确。"
-        ) from exc
+            f"拉取 Google 表格失败 (HTTP {status})；请确认源表已设为「知道链接的任何人可查看」或 Sheet ID / GID 正确。"
+        )
 
+    content_type = (headers.get("content-type") or "").lower()
     if "text/html" in content_type or raw.lstrip().lower().startswith("<!doctype html"):
         raise RuntimeError(
             "Google 表格返回了 HTML 登录页而非 CSV，说明该表尚未开启「知道链接的任何人可查看」权限。"
@@ -205,11 +247,19 @@ def parse_mcp_response_body(raw_text: str) -> dict[str, Any] | None:
 class TencentMcpClient:
     """腾讯文档官方 HTTP MCP 客户端封装（共用 TENCENT_DOCS_TOKEN）。"""
 
-    def __init__(self, token: str, timeout: int = 30) -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        retries: int = DEFAULT_HTTP_RETRIES,
+        retry_delay: float = 1.0,
+    ) -> None:
         self._token = token.strip()
         if not self._token:
             raise ValueError("缺少环境变量 TENCENT_DOCS_TOKEN")
         self._timeout = timeout
+        self._retries = retries
+        self._retry_delay = retry_delay
         self._sessions: dict[str, str | None] = {}
         self._tools_cache: dict[str, list[dict[str, Any]]] = {}
         self._auth_header: str = self._token
@@ -232,14 +282,12 @@ class TencentMcpClient:
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                return resp.status, resp_headers, resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-            return exc.code, resp_headers, body
+        return _http_request_with_retry(
+            req,
+            timeout=self._timeout,
+            retries=self._retries,
+            retry_delay=self._retry_delay,
+        )
 
     def _ensure_session(self, endpoint: str) -> str | None:
         if endpoint in self._sessions:
@@ -547,6 +595,51 @@ def _first_diff_summary(src: list[list[str]], dst: list[list[str]]) -> str:
     return "trailing_empty_diff"
 
 
+def validate_task_config(task: dict[str, Any]) -> None:
+    """前置校验单个同步任务配置的必填项与腾讯文档子表名限制。"""
+    google_id = (task.get("google_spreadsheet_id") or "").strip()
+    if not google_id:
+        raise ValueError("同步任务缺少 google_spreadsheet_id")
+
+    sheet_name = (task.get("tencent_sheet_name") or "").strip()
+    if sheet_name:
+        if len(sheet_name) > MAX_SHEET_NAME_LEN:
+            raise ValueError(
+                f"腾讯子表名称不能超过 {MAX_SHEET_NAME_LEN} 个字符（当前 {len(sheet_name)}）: {sheet_name}"
+            )
+        if _INVALID_SHEET_CHARS_RE.search(sheet_name):
+            raise ValueError(f"腾讯子表名称包含非法字符 (: \\ / ? * [ ]): {sheet_name}")
+
+
+def clear_sheet_range_chunked(
+    client: TencentMcpClient,
+    file_id: str,
+    sheet_id: str,
+    end_row: int,
+    end_col: int,
+    chunk_cells: int = CLEAR_CHUNK_CELLS,
+) -> None:
+    """按行分块清空指定范围单元格内容（保留样式），避免超大范围触发超时或超限。"""
+    if end_row < 0 or end_col < 0:
+        return
+    cols = end_col + 1
+    rows_per_chunk = max(1, chunk_cells // max(cols, 1))
+    for r0 in range(0, end_row + 1, rows_per_chunk):
+        r1 = min(end_row, r0 + rows_per_chunk - 1)
+        client.call_tool(
+            MCP_SHEET_URL,
+            "sheet.clear_range_cells",
+            {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "start_row": r0,
+                "start_col": 0,
+                "end_row": r1,
+                "end_col": end_col,
+            },
+        )
+
+
 def sync_one_task(
     client: TencentMcpClient,
     task: dict[str, Any],
@@ -554,6 +647,7 @@ def sync_one_task(
     title_cache: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """执行单个 Google 工作表到腾讯文档子表的单向覆盖同步。"""
+    validate_task_config(task)
     google_id = task["google_spreadsheet_id"].strip()
     google_gid = str(task.get("google_gid", "0")).strip()
     rows = fetch_google_sheet_csv(google_id, google_gid)
@@ -642,17 +736,8 @@ def sync_one_task(
     clear_end_row = max(cur_rows - 1, len(rows) - 1, 0)
     clear_end_col = max(cur_cols - 1, max_src_cols - 1, 0)
     if old_rows > 0 or rows:
-        client.call_tool(
-            MCP_SHEET_URL,
-            "sheet.clear_range_cells",
-            {
-                "file_id": tencent_file_id,
-                "sheet_id": sub_id,
-                "start_row": 0,
-                "start_col": 0,
-                "end_row": clear_end_row,
-                "end_col": clear_end_col,
-            },
+        clear_sheet_range_chunked(
+            client, tencent_file_id, sub_id, clear_end_row, clear_end_col
         )
 
     values = build_cell_values(rows)
@@ -737,12 +822,27 @@ def main() -> int:
     client = TencentMcpClient(token)
     title_cache: dict[str, tuple[str, str]] = {}
 
-    results = []
+    results: list[dict[str, Any]] = []
+    has_failure = False
     for idx, task in enumerate(tasks, start=1):
-        res = sync_one_task(client, task, force=force, title_cache=title_cache)
-        results.append({"task": idx, **res})
+        try:
+            res = sync_one_task(client, task, force=force, title_cache=title_cache)
+            results.append({"task": idx, "ok": True, **res})
+        except Exception as exc:
+            has_failure = True
+            print(f"[任务 {idx} 失败] {exc}", file=sys.stderr)
+            results.append(
+                {
+                    "task": idx,
+                    "ok": False,
+                    "google_spreadsheet_id": (task.get("google_spreadsheet_id") or "").strip(),
+                    "google_gid": str(task.get("google_gid", "0")).strip(),
+                    "tencent_sheet_name": (task.get("tencent_sheet_name") or "").strip(),
+                    "error": str(exc),
+                }
+            )
     print(json.dumps(results, ensure_ascii=False, indent=2))
-    return 0
+    return 1 if has_failure else 0
 
 
 if __name__ == "__main__":
