@@ -29,6 +29,7 @@ TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 _NUM_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
 _INVALID_SHEET_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
+_GOOGLE_URL_ID_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
 
 
 def infer_cell_payload(row: int, col: int, text: str) -> dict[str, Any] | None:
@@ -438,6 +439,36 @@ class TencentMcpClient:
         return parsed
 
 
+def _to_file_ref(file_target: str | dict[str, str]) -> dict[str, str]:
+    """统一将字符串文档 ID 或引用字典规范为 MCP 文件定位参数。"""
+    if isinstance(file_target, dict):
+        return dict(file_target)
+    return {"file_id": file_target}
+
+
+def normalize_google_sheet_id(raw_value: str) -> str:
+    """支持直接传入 Google Sheet ID 或完整分享链接并提取文档 ID。"""
+    cleaned = raw_value.strip()
+    match = _GOOGLE_URL_ID_RE.search(cleaned)
+    return match.group(1) if match else cleaned
+
+
+def build_tencent_file_ref(
+    raw_ref: str,
+) -> tuple[dict[str, str], dict[str, str] | None, str]:
+    """根据腾讯文档完整 URL、D 开头浏览器路径串或短 ID 生成主备定位参数。"""
+    cleaned = raw_ref.strip()
+    if "://" in cleaned:
+        clean_url = cleaned.split("#", 1)[0].split("?", 1)[0]
+        return {"file_url": clean_url}, None, clean_url
+
+    url_guess = f"https://docs.qq.com/sheet/{cleaned}"
+    # 浏览器分享路径串一般以 D 开头且长度 >= 16，优先以 file_url 方式传递并保留 file_id 兜底
+    if cleaned.startswith("D") and len(cleaned) >= 16:
+        return {"file_url": url_guess}, {"file_id": cleaned}, url_guess
+    return {"file_id": cleaned}, {"file_url": url_guess}, url_guess
+
+
 def pick_target_subsheet(
     sheets: list[dict[str, Any]], desired_id: str | None = None, desired_name: str | None = None
 ) -> dict[str, Any]:
@@ -459,12 +490,14 @@ def pick_target_subsheet(
 
 def resolve_or_create_subsheet(
     client: TencentMcpClient,
-    file_id: str,
+    file_target: str | dict[str, str],
     desired_id: str | None = None,
     desired_name: str | None = None,
+    prefetched_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """获取目标子表元信息；若按名称未命中且允许创建，则自动新增该子表。"""
-    info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": file_id})
+    file_ref = _to_file_ref(file_target)
+    info = prefetched_info or client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", file_ref)
     sheets = info.get("sheets") or []
     try:
         return pick_target_subsheet(sheets, desired_id=desired_id, desired_name=desired_name)
@@ -475,16 +508,16 @@ def resolve_or_create_subsheet(
     client.call_tool(
         MCP_SHEET_URL,
         "sheet.add_sheet",
-        {"file_id": file_id, "name": desired_name, "append_index": True},
+        {**file_ref, "name": desired_name, "append_index": True},
     )
-    print(f"[新建子表] {file_id} -> {desired_name}", file=sys.stderr)
-    refreshed = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", {"file_id": file_id})
+    print(f"[新建子表] {next(iter(file_ref.values()))} -> {desired_name}", file=sys.stderr)
+    refreshed = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", file_ref)
     return pick_target_subsheet(refreshed.get("sheets") or [], desired_name=desired_name)
 
 
 def _expand_dimension(
     client: TencentMcpClient,
-    file_id: str,
+    file_target: str | dict[str, str],
     sheet_id: str,
     dim_type: str,
     current: int,
@@ -495,6 +528,7 @@ def _expand_dimension(
     if current <= 0 or needed <= current:
         return current
     print(f"[扩展{dim_type}] {sheet_id}: {current} -> {needed}", file=sys.stderr)
+    file_ref = _to_file_ref(file_target)
     cur = current
     remaining = needed - cur
     while remaining > 0:
@@ -503,7 +537,7 @@ def _expand_dimension(
             MCP_SHEET_URL,
             "sheet.insert_dimension",
             {
-                "file_id": file_id,
+                **file_ref,
                 "sheet_id": sheet_id,
                 "dimension_type": dim_type,
                 "index": cur - 1,
@@ -518,7 +552,7 @@ def _expand_dimension(
 
 def ensure_sheet_capacity(
     client: TencentMcpClient,
-    file_id: str,
+    file_target: str | dict[str, str],
     sheet_id: str,
     current_rows: int,
     current_cols: int,
@@ -526,14 +560,14 @@ def ensure_sheet_capacity(
     needed_cols: int,
 ) -> tuple[int, int]:
     """确保目标子表拥有足够容纳源表数据的行列数。"""
-    new_rows = _expand_dimension(client, file_id, sheet_id, "row", current_rows, needed_rows, 200)
-    new_cols = _expand_dimension(client, file_id, sheet_id, "col", current_cols, needed_cols, 100)
+    new_rows = _expand_dimension(client, file_target, sheet_id, "row", current_rows, needed_rows, 200)
+    new_cols = _expand_dimension(client, file_target, sheet_id, "col", current_cols, needed_cols, 100)
     return new_rows, new_cols
 
 
 def read_sheet_matrix_chunked(
     client: TencentMcpClient,
-    file_id: str,
+    file_target: str | dict[str, str],
     sheet_id: str,
     total_rows: int,
     total_cols: int,
@@ -543,6 +577,7 @@ def read_sheet_matrix_chunked(
     if total_rows <= 0 or total_cols <= 0:
         return [], ""
 
+    file_ref = _to_file_ref(file_target)
     rows_per_chunk = max(1, chunk_cells // max(total_cols, 1))
     all_rows: list[list[str]] = []
     first_csv = ""
@@ -552,7 +587,7 @@ def read_sheet_matrix_chunked(
             MCP_SHEET_URL,
             "sheet.get_cell_data",
             {
-                "file_id": file_id,
+                **file_ref,
                 "sheet_id": sheet_id,
                 "start_row": r0,
                 "start_col": 0,
@@ -575,8 +610,10 @@ def read_sheet_matrix_chunked(
     return all_rows, first_csv
 
 
-def _first_diff_summary(src: list[list[str]], dst: list[list[str]]) -> str:
-    """定位源表与目标表首个存在差异的单元格，便于排查哈希不匹配。"""
+def _first_diff_summary(
+    src: list[list[str]], dst: list[list[str]], include_values: bool = False
+) -> str:
+    """定位源表与目标表首个存在差异的单元格，默认脱敏仅返回坐标。"""
     max_r = max(len(src), len(dst))
     for r in range(max_r):
         sr = list(src[r]) if r < len(src) else []
@@ -591,13 +628,15 @@ def _first_diff_summary(src: list[list[str]], dst: list[list[str]]) -> str:
                 sv = sr[c] if c < len(sr) else ""
                 dv = dr[c] if c < len(dr) else ""
                 if sv != dv:
-                    return f"({r},{c}) src={sv!r} dst={dv!r}"
+                    if include_values:
+                        return f"({r},{c}) src={sv!r} dst={dv!r}"
+                    return f"({r},{c})"
     return "trailing_empty_diff"
 
 
 def validate_task_config(task: dict[str, Any]) -> None:
     """前置校验单个同步任务配置的必填项与腾讯文档子表名限制。"""
-    google_id = (task.get("google_spreadsheet_id") or "").strip()
+    google_id = normalize_google_sheet_id(task.get("google_spreadsheet_id") or "")
     if not google_id:
         raise ValueError("同步任务缺少 google_spreadsheet_id")
 
@@ -613,7 +652,7 @@ def validate_task_config(task: dict[str, Any]) -> None:
 
 def clear_sheet_range_chunked(
     client: TencentMcpClient,
-    file_id: str,
+    file_target: str | dict[str, str],
     sheet_id: str,
     end_row: int,
     end_col: int,
@@ -622,6 +661,7 @@ def clear_sheet_range_chunked(
     """按行分块清空指定范围单元格内容（保留样式），避免超大范围触发超时或超限。"""
     if end_row < 0 or end_col < 0:
         return
+    file_ref = _to_file_ref(file_target)
     cols = end_col + 1
     rows_per_chunk = max(1, chunk_cells // max(cols, 1))
     for r0 in range(0, end_row + 1, rows_per_chunk):
@@ -630,7 +670,7 @@ def clear_sheet_range_chunked(
             MCP_SHEET_URL,
             "sheet.clear_range_cells",
             {
-                "file_id": file_id,
+                **file_ref,
                 "sheet_id": sheet_id,
                 "start_row": r0,
                 "start_col": 0,
@@ -640,22 +680,44 @@ def clear_sheet_range_chunked(
         )
 
 
+def _fetch_sheet_info_with_fallback(
+    client: TencentMcpClient,
+    primary_ref: dict[str, str],
+    fallback_ref: dict[str, str] | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """探测腾讯文档表格定位参数（file_id / file_url），并在必要时尝试备选参数。"""
+    try:
+        info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", primary_ref)
+        return info, primary_ref
+    except Exception as first_exc:
+        if not fallback_ref:
+            raise
+        try:
+            info = client.call_tool(MCP_SHEET_URL, "sheet.get_sheet_info", fallback_ref)
+            return info, fallback_ref
+        except Exception:
+            raise first_exc
+
+
 def sync_one_task(
     client: TencentMcpClient,
     task: dict[str, Any],
     force: bool = False,
     title_cache: dict[str, tuple[str, str]] | None = None,
+    debug_preview: bool = False,
 ) -> dict[str, Any]:
     """执行单个 Google 工作表到腾讯文档子表的单向覆盖同步。"""
     validate_task_config(task)
-    google_id = task["google_spreadsheet_id"].strip()
-    google_gid = str(task.get("google_gid", "0")).strip()
+    google_id = normalize_google_sheet_id(task["google_spreadsheet_id"])
+    google_gid = str(task.get("google_gid", "0")).strip() or "0"
     rows = fetch_google_sheet_csv(google_id, google_gid)
     src_hash = compute_matrix_hash(rows)
 
-    tencent_file_id = (task.get("tencent_file_id") or "").strip()
+    raw_target = (task.get("tencent_file_url") or task.get("tencent_file_id") or "").strip()
+    tencent_file_id = ""
     tencent_url = ""
-    if not tencent_file_id:
+    fallback_ref: dict[str, str] | None = None
+    if not raw_target:
         title = (task.get("create_title") or "[回传测试] 腾讯目标表")[:36]
         if title_cache is not None and title in title_cache:
             tencent_file_id, tencent_url = title_cache[title]
@@ -679,15 +741,21 @@ def sync_one_task(
                 raise RuntimeError("自动获取或创建腾讯空白表失败")
             if title_cache is not None:
                 title_cache[title] = (tencent_file_id, tencent_url)
+        file_ref: dict[str, str] = {"file_id": tencent_file_id}
     else:
-        tencent_url = f"https://docs.qq.com/sheet/{tencent_file_id}"
-    print(f"[目标腾讯表] {tencent_file_id} -> {tencent_url}", file=sys.stderr)
+        file_ref, fallback_ref, tencent_url = build_tencent_file_ref(raw_target)
+        tencent_file_id = raw_target
+
+    info, active_ref = _fetch_sheet_info_with_fallback(client, file_ref, fallback_ref)
+    target_label = active_ref.get("file_id") or active_ref.get("file_url") or tencent_file_id
+    print(f"[目标腾讯表] {target_label} -> {tencent_url}", file=sys.stderr)
 
     sub = resolve_or_create_subsheet(
         client,
-        tencent_file_id,
+        active_ref,
         desired_id=task.get("tencent_sheet_id") or None,
         desired_name=task.get("tencent_sheet_name") or None,
+        prefetched_info=info,
     )
     sub_id = sub["sheet_id"]
     old_rows, old_cols = extract_used_dimensions(sub)
@@ -699,14 +767,14 @@ def sync_one_task(
     # 通过分块回读当前内容做变化检测，未改动则直接跳过写入，减少版本碎片
     if not force and old_rows > 0 and old_cols > 0 and old_rows * old_cols <= MAX_READ_CELLS:
         existing_rows, _ = read_sheet_matrix_chunked(
-            client, tencent_file_id, sub_id, old_rows, old_cols
+            client, active_ref, sub_id, old_rows, old_cols
         )
         existing_hash = compute_matrix_hash(existing_rows)
         if existing_hash == src_hash:
             return {
                 "skipped": True,
                 "reason": "目标表格内容已与源表一致",
-                "tencent_file_id": tencent_file_id,
+                "tencent_file_id": target_label,
                 "tencent_url": tencent_url,
                 "sheet_id": sub_id,
                 "sheet_name": sub.get("sheet_name"),
@@ -714,7 +782,7 @@ def sync_one_task(
         print(
             f"[变化检测未命中] src_rows={len(rows)}, existing_rows={len(existing_rows)}, "
             f"src_hash={src_hash[:12]}, existing_hash={existing_hash[:12]}, "
-            f"first_diff={_first_diff_summary(rows, existing_rows)}",
+            f"first_diff={_first_diff_summary(rows, existing_rows, include_values=debug_preview)}",
             file=sys.stderr,
         )
     else:
@@ -726,7 +794,7 @@ def sync_one_task(
     max_src_cols = max((len(r) for r in rows), default=0)
     cur_rows, cur_cols = ensure_sheet_capacity(
         client,
-        tencent_file_id,
+        active_ref,
         sub_id,
         old_rows,
         old_cols,
@@ -737,7 +805,7 @@ def sync_one_task(
     clear_end_col = max(cur_cols - 1, max_src_cols - 1, 0)
     if old_rows > 0 or rows:
         clear_sheet_range_chunked(
-            client, tencent_file_id, sub_id, clear_end_row, clear_end_col
+            client, active_ref, sub_id, clear_end_row, clear_end_col
         )
 
     values = build_cell_values(rows)
@@ -746,29 +814,30 @@ def sync_one_task(
         client.call_tool(
             MCP_SHEET_URL,
             "sheet.set_range_value",
-            {"file_id": tencent_file_id, "sheet_id": sub_id, "values": batch},
+            {**active_ref, "sheet_id": sub_id, "values": batch},
         )
 
     read_back_csv = ""
     verified_hash_match: bool | None = None
     if rows and max_src_cols > 0 and len(rows) * max_src_cols <= MAX_READ_CELLS:
         rb_rows, first_csv = read_sheet_matrix_chunked(
-            client, tencent_file_id, sub_id, len(rows), max_src_cols
+            client, active_ref, sub_id, len(rows), max_src_cols
         )
         verified_hash_match = compute_matrix_hash(rb_rows) == src_hash
         if not verified_hash_match:
             print(
-                f"[写入回读差异] first_diff={_first_diff_summary(rows, rb_rows)}",
+                f"[写入回读差异] first_diff={_first_diff_summary(rows, rb_rows, include_values=debug_preview)}",
                 file=sys.stderr,
             )
-        if len(first_csv) > READ_BACK_PREVIEW_CHARS:
-            read_back_csv = first_csv[:READ_BACK_PREVIEW_CHARS] + "\n... (truncated)"
-        else:
-            read_back_csv = first_csv
+        if debug_preview:
+            if len(first_csv) > READ_BACK_PREVIEW_CHARS:
+                read_back_csv = first_csv[:READ_BACK_PREVIEW_CHARS] + "\n... (truncated)"
+            else:
+                read_back_csv = first_csv
 
-    return {
+    output: dict[str, Any] = {
         "skipped": False,
-        "tencent_file_id": tencent_file_id,
+        "tencent_file_id": target_label,
         "tencent_url": tencent_url,
         "sheet_id": sub_id,
         "sheet_name": sub.get("sheet_name"),
@@ -776,8 +845,10 @@ def sync_one_task(
         "source_cols": max_src_cols,
         "written_cells": len(values),
         "verified_hash_match": verified_hash_match,
-        "read_back_csv": read_back_csv,
     }
+    if debug_preview:
+        output["read_back_csv"] = read_back_csv
+    return output
 
 
 def load_tasks_from_env_or_config(
@@ -792,6 +863,7 @@ def load_tasks_from_env_or_config(
                     "google_spreadsheet_id": env_google_id,
                     "google_gid": os.getenv("GOOGLE_GID", "0").strip() or "0",
                     "tencent_file_id": os.getenv("TENCENT_FILE_ID", "").strip(),
+                    "tencent_file_url": os.getenv("TENCENT_FILE_URL", "").strip(),
                     "tencent_sheet_id": os.getenv("TENCENT_SHEET_ID", "").strip(),
                     "tencent_sheet_name": os.getenv("TENCENT_SHEET_NAME", "").strip(),
                     "create_title": os.getenv("TENCENT_CREATE_TITLE", "[回传测试] 腾讯目标表").strip(),
@@ -816,6 +888,7 @@ def main() -> int:
         return 2
 
     force = os.getenv("FORCE_SYNC", "").strip().lower() in {"1", "true", "yes"}
+    debug_preview = os.getenv("DEBUG_PREVIEW", "").strip().lower() in {"1", "true", "yes"}
     env_config = os.getenv("SYNC_CONFIG", "").strip()
     config_file = Path(env_config) if env_config else Path("config.json")
     tasks = load_tasks_from_env_or_config(config_file, explicit_config=bool(env_config))
@@ -826,7 +899,13 @@ def main() -> int:
     has_failure = False
     for idx, task in enumerate(tasks, start=1):
         try:
-            res = sync_one_task(client, task, force=force, title_cache=title_cache)
+            res = sync_one_task(
+                client,
+                task,
+                force=force,
+                title_cache=title_cache,
+                debug_preview=debug_preview,
+            )
             results.append({"task": idx, "ok": True, **res})
         except Exception as exc:
             has_failure = True
@@ -835,7 +914,9 @@ def main() -> int:
                 {
                     "task": idx,
                     "ok": False,
-                    "google_spreadsheet_id": (task.get("google_spreadsheet_id") or "").strip(),
+                    "google_spreadsheet_id": normalize_google_sheet_id(
+                        task.get("google_spreadsheet_id") or ""
+                    ),
                     "google_gid": str(task.get("google_gid", "0")).strip(),
                     "tencent_sheet_name": (task.get("tencent_sheet_name") or "").strip(),
                     "error": str(exc),

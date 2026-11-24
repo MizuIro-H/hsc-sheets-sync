@@ -335,7 +335,7 @@ class SyncUnitTests(unittest.TestCase):
             {"google_spreadsheet_id": "ok_g", "tencent_sheet_name": "tab2"},
         ]
 
-        def fake_sync(client, task, force=False, title_cache=None):
+        def fake_sync(client, task, force=False, title_cache=None, debug_preview=False):
             if task["google_spreadsheet_id"] == "bad_g":
                 raise RuntimeError("boom")
             return {"skipped": True, "sheet_name": "tab2"}
@@ -356,6 +356,55 @@ class SyncUnitTests(unittest.TestCase):
         self.assertIn("boom", out[0]["error"])
         self.assertTrue(out[1]["ok"])
         self.assertTrue(out[1]["skipped"])
+
+    def test_file_ref_and_google_url_normalization(self) -> None:
+        self.assertEqual(
+            sync.normalize_google_sheet_id(
+                "https://docs.google.com/spreadsheets/d/1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk/edit?gid=0#gid=0"
+            ),
+            "1DEfk-_2Xfo5Ipo1dT6CL5JLc6zGUoX27vIk2RBQuqPk",
+        )
+        p1, f1, u1 = sync.build_tencent_file_ref("https://docs.qq.com/sheet/DVk9CRndKb3hhYW5v?tab=BB08J2")
+        self.assertEqual(p1, {"file_url": "https://docs.qq.com/sheet/DVk9CRndKb3hhYW5v"})
+        self.assertIsNone(f1)
+        self.assertEqual(u1, "https://docs.qq.com/sheet/DVk9CRndKb3hhYW5v")
+
+        p2, f2, _ = sync.build_tencent_file_ref("DVk9CRndKb3hhYW5v")
+        self.assertEqual(p2, {"file_url": "https://docs.qq.com/sheet/DVk9CRndKb3hhYW5v"})
+        self.assertEqual(f2, {"file_id": "DVk9CRndKb3hhYW5v"})
+
+        p3, f3, _ = sync.build_tencent_file_ref("LrSgRxUBjDag")
+        self.assertEqual(p3, {"file_id": "LrSgRxUBjDag"})
+        self.assertEqual(f3, {"file_url": "https://docs.qq.com/sheet/LrSgRxUBjDag"})
+
+    def test_file_url_fallback_and_preview_hidden_by_default(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class FakeClient:
+            def call_tool(self, endpoint: str, tool_name: str, args: dict) -> dict:
+                calls.append((tool_name, dict(args)))
+                if tool_name == "sheet.get_sheet_info":
+                    if "file_url" in args and "file_id" not in args:
+                        raise RuntimeError("not found by url")
+                    return {"sheets": [{"sheet_id": "s0", "sheet_name": "工作表1", "row_count": 2, "col_count": 2}]}
+                if tool_name == "sheet.get_cell_data":
+                    return {"csv_data": "A,B\n1,2\n"}
+                return {}
+
+        with patch.object(sync, "fetch_google_sheet_csv", return_value=[["A", "B"], ["1", "2"]]):
+            res = sync.sync_one_task(
+                FakeClient(),
+                {"google_spreadsheet_id": "g1", "tencent_file_id": "D" + "x" * 16},
+                force=True,
+                debug_preview=False,
+            )
+
+        self.assertTrue(res["verified_hash_match"])
+        self.assertNotIn("read_back_csv", res)
+        self.assertEqual(calls[0][0], "sheet.get_sheet_info")
+        self.assertIn("file_url", calls[0][1])
+        self.assertEqual(calls[1][0], "sheet.get_sheet_info")
+        self.assertIn("file_id", calls[1][1])
 
 
 if __name__ == "__main__":
