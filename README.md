@@ -28,7 +28,7 @@
    - `TENCENT_FILE_ID`（或 `TENCENT_FILE_URL`）：腾讯目标表链接、`D...` 编码串或短 ID（正式接入务必固定填写）
    - `TENCENT_SHEET_NAME`（可选）：目标腾讯子表名称（如 `_sync_data`；留空则写首个子表）
    - `SYNC_CONFIG`（可选）：多任务配置文件路径（例如 `configs/hsc2s8e.json`；设置后优先于单表变量）
-3. 前往 **Actions → Sync Google Sheets to Tencent Docs → Run workflow** 按需手动触发即可；当前已关闭自动定时检查（如需自动周期检查，可在 [sync.yml](.github/workflows/sync.yml) 中取消 `schedule` 段注释）。
+3. 已开启 [sync.yml](.github/workflows/sync.yml) 中的每 30 分钟定时检查（`*/30 * * * *`），也可前往 **Actions → Sync Google Sheets to Tencent Docs → Run workflow** 按需手动触发一次。
 4. 多表/多分页同步可参考 [config.example.json](config.example.json)。注意 [.gitignore](.gitignore) 默认忽略根目录 `config.json`，如需入库管理请改名为如 `configs/my_event.json`，并在 `config_path` 输入或 `vars.SYNC_CONFIG` 变量中指定。
 
 ## 使用边界与注意事项
